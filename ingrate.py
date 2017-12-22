@@ -90,72 +90,130 @@ async def main():
         apis = ak8s.bind_api_group(registry.apis)
         ic = IngrateController(ak8s=ak8s, registry=registry)
 
-        async for d in ic.watch_ingresses_and_related_resources(label_selector=args.selector, throttle=0.5):
-            # Sort to stabilize output.
-            d['ingresses'] = sorted(
-                    d['ingresses'],
-                    key=lambda ing: (ing.metadata.namespace, ing.metadata.name))
+        mingler = amingle()
 
-            try:
-                haproxy_cfg = haproxy_cfg_tpl.render(**d)
-            except Exception:
-                print(mako.exceptions.text_error_template().render())
-                continue
+        mingler.add(azip(
+            repeat('ingresses'),
+            ic.watch_ingresses_and_related_resources(label_selector=args.selector, throttle=0.5)))
+        mingler.add(azip(
+            repeat('load_balancers'),
+            athrottle(
+                ic.watch_for_deployment_exposure(args.namespace, args.name),
+                0.5)))
 
-            ### Load existing deployment, to find the current version of the
-            ### configmap.
-            existing_deployment = await ic.read_deployment(args.namespace, args.name)
-            configmap = await ic.validate_or_create_ingrate_configmap(
-                    {'haproxy.cfg': haproxy_cfg},
-                    deployment=existing_deployment,
-                    namespace=args.namespace,
-                    name=args.name)
+        ingresses = None
+        load_balancers = None
 
-            ### Generate new deployment.
-            try:
-                deployment_yaml = deployment_tpl.render(
-                        configmap=configmap,
-                        **d)
-            except Exception:
-                print(mako.exceptions.text_error_template().render())
-                continue
+        async for tag,d in mingler:
+            if tag == 'ingresses':
+                # Sort to stabilize output.
+                ingresses = d['ingresses'] = sorted(
+                        d['ingresses'],
+                        key=lambda ing: (ing.metadata.namespace, ing.metadata.name))
 
-            if existing_deployment:
-                existing_deployment_yaml = existing_deployment.metadata.annotations.get('ingress-deployment-yaml')
+                try:
+                    haproxy_cfg = haproxy_cfg_tpl.render(**d)
+                except Exception:
+                    print(mako.exceptions.text_error_template().render())
+                    continue
 
-                if existing_deployment_yaml and existing_deployment_yaml != deployment_yaml:
-                    logger.info(
-                            'diff %s\n%s',
-                            'deployment.yaml',
-                            ''.join(difflib.unified_diff(
-                                existing_deployment_yaml.splitlines(True),
-                                deployment_yaml.splitlines(True))))
+                ### Load existing deployment, to find the current version of the
+                ### configmap.
+                existing_deployment = await ic.read_deployment(args.namespace, args.name)
+                configmap = await ic.validate_or_create_ingrate_configmap(
+                        {'haproxy.cfg': haproxy_cfg},
+                        deployment=existing_deployment,
+                        namespace=args.namespace,
+                        name=args.name)
 
-            deployment = registry.models.io.k8s.kubernetes.pkg.apis.apps.v1beta1.Deployment._project(
-                    yaml.load(deployment_yaml))
+                ### Generate new deployment.
+                try:
+                    deployment_yaml = deployment_tpl.render(
+                            configmap=configmap,
+                            **d)
+                except Exception:
+                    print(mako.exceptions.text_error_template().render())
+                    continue
 
-            ic.init_deployment(deployment, name=args.name, configmap=configmap)
-            deployment.metadata.annotations['ingress-deployment-yaml'] = deployment_yaml
+                if existing_deployment:
+                    existing_deployment_yaml = existing_deployment.metadata.annotations.get('ingress-deployment-yaml')
 
-            deployment = await ic.replace_or_create_deployment(
-                    args.namespace, args.name, deployment)
-            deployment = await ic.watch_for_deployment_revision_to_post(
-                    deployment)
+                    if existing_deployment_yaml and existing_deployment_yaml != deployment_yaml:
+                        logger.info(
+                                'diff %s\n%s',
+                                'deployment.yaml',
+                                ''.join(difflib.unified_diff(
+                                    existing_deployment_yaml.splitlines(True),
+                                    deployment_yaml.splitlines(True))))
 
-            existing_deployment_revision = existing_deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
-            deployment_revision = deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
-            if deployment_revision == existing_deployment_revision:
-                logger.debug('Existing deployment suffices')
-                continue
+                deployment = registry.models.io.k8s.kubernetes.pkg.apis.apps.v1beta1.Deployment._project(
+                        yaml.load(deployment_yaml))
 
-            logger.info('Deployment revised, hang on...')
+                ic.init_deployment(deployment, name=args.name, configmap=configmap)
+                deployment.metadata.annotations['ingress-deployment-yaml'] = deployment_yaml
 
-            replicaset = await ic.watch_for_replicaset_matching_deployment_revision(
-                    deployment)
+                deployment = await ic.replace_or_create_deployment(
+                        args.namespace, args.name, deployment)
+                deployment = await ic.watch_for_deployment_revision_to_post(
+                        deployment)
 
-            # Referencing the replicaset in the configmap owner references should
-            # cause the configmap to be cleaned up when the replicaset is removed.
-            await ic.add_configmap_owner_ref(configmap, replicaset)
+                existing_deployment_revision = existing_deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
+                deployment_revision = deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
+                if deployment_revision == existing_deployment_revision:
+                    logger.debug('Existing deployment suffices')
+                    continue
+
+                logger.info('Deployment revision is now %r, hang on...', deployment_revision)
+
+                replicaset = await ic.watch_for_replicaset_matching_deployment_revision(
+                        deployment)
+
+                # Referencing the replicaset in the configmap owner references should
+                # cause the configmap to be cleaned up when the replicaset is removed.
+                await ic.add_configmap_owner_ref(configmap, replicaset)
+
+            elif tag == 'load_balancers':
+                # This is the shape of both ServiceStatus and IngressStatus
+                #   status:
+                #     loadBalancer:
+                #       ingress:
+                #       - hostname: abc123...elb.amazonaws.com
+
+                # There could be more than one service, and there could be more
+                # than one ingress for each one.  Maybe we need to be select
+                # just one ingress, or just one service, or maybe we want all
+                # of them.
+
+                load_balancers = d['load_balancers']
+
+            # TODO: Allow discovery to be overriden with an annotation.
+            if none_is_none(ingresses, load_balancers):
+                if not load_balancers:
+                    # No exposures found
+                    continue
+
+                # Merge multiple services into one.
+                load_balancer = registry.models.io.k8s.kubernetes.pkg.api.v1.LoadBalancerStatus(ingress=[])
+                for lb in load_balancers:
+                    load_balancer.ingress.extend(lb.ingress)
+
+                for ing in ingresses:
+                    if ing.status and ing.status.loadBalancer and ing.status.loadBalancer == load_balancer:
+                        continue
+
+                    logger.info('Updating ingress %s:%s status with %r',
+                            ing.metadata.namespace,
+                            ing.metadata.name,
+                            load_balancer)
+                    await apis.extensions_v1beta1.replace_namespaced_ingress_status(
+                            ing.metadata.namespace,
+                            ing.metadata.name,
+                            registry.models.io.k8s.kubernetes.pkg.apis.extensions.v1beta1.Ingress(
+                                metadata=registry.models.io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta(
+                                    namespace=ing.metadata.namespace,
+                                    name=ing.metadata.name),
+                                status=registry.models.io.k8s.kubernetes.pkg.apis.extensions.v1beta1.IngressStatus(
+                                    loadBalancer=load_balancer)))
 
 
 DEPLOYMENT_REVISION_ANNOTATION = 'deployment.kubernetes.io/revision'
@@ -590,6 +648,29 @@ class IngrateController:
                         rs.metadata.name,
                         revision)
                 return rs
+
+    async def watch_for_deployment_exposure(self, namespace, name):
+        service_list = await self._apis.core_v1.list_namespaced_service(
+                namespace,
+                labelSelector=f'{INGRATE_NAME_LABEL}={name}')
+        load_balancers = {
+                svc.metadata.name: svc.status.loadBalancer
+                for svc in service_list.items
+                if svc.status and svc.status.loadBalancer }
+        yield dict(load_balancers=load_balancers)
+
+        async for ev, svc in self._apis.core_v1.watch_namespaced_service_list.watch(
+                namespace,
+                labelSelector=f'{INGRATE_NAME_LABEL}={name}'):
+            if ev in {'ADDED', 'MODIFIED'} and svc.spec.type == 'LoadBalancer':
+                if svc.status and svc.status.loadBalancer:
+                    load_balancers[svc.metadata.name] = svc.status.loadBalancer
+            elif ev == 'DELETED' and svc.spec.type == 'LoadBalancer':
+                if svc.metadata.name in load_balancers:
+                    del load_balancers[svc.metadata.name]
+            else:
+                continue
+            yield dict(load_balancers=load_balancers.values())
 
 
 def none_is_none(*items):
