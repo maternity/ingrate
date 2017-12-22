@@ -161,8 +161,8 @@ async def main():
 DEPLOYMENT_REVISION_ANNOTATION = 'deployment.kubernetes.io/revision'
 INGRATE_CONFIGMAP_VERSION_ANNOTATION = 'ingrate-configmap-version'
 #INGRATE_CONFIGMAP_VERSION_ANNOTATION = 'ingrate.maternity.io/configmap-version'
-INGRATE_NAME_ANNOTATION = 'ingrate-name'
-#INGRATE_NAME_ANNOTATION = 'ingrate.maternity.io/name'
+INGRATE_NAME_LABEL = 'ingrate-name'
+#INGRATE_NAME_LABEL = 'ingrate.maternity.io/name'
 INGRATE_RELEASE_COOKIE_ANNOTATION = 'ingrate.maternity.io/release-cookie'
 INGRATE_RELEASE_DEFAULT_ANNOTATION = 'ingrate.maternity.io/release-default'
 INGRATE_RELEASE_SELECTOR_ANNOTATION = 'ingrate.maternity.io/release-selector'
@@ -488,7 +488,7 @@ class IngrateController:
         configmap = self._models.io.k8s.kubernetes.pkg.api.v1.ConfigMap(
                 metadata=self._models.io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta(
                     generateName=f'{name}-',
-                    labels={INGRATE_NAME_ANNOTATION: name}),
+                    labels={INGRATE_NAME_LABEL: name}),
                 data=data)
 
         configmap = await self.create_configmap(namespace, configmap)
@@ -514,7 +514,7 @@ class IngrateController:
         # template if no selector is provided.
         if deployment.spec.template.metadata.labels is None:
             deployment.spec.template.metadata.labels = {}
-        deployment.spec.template.metadata.labels[INGRATE_NAME_ANNOTATION] = name
+        deployment.spec.template.metadata.labels[INGRATE_NAME_LABEL] = name
 
     async def replace_or_create_deployment(
             self, namespace, name, deployment):
@@ -578,7 +578,10 @@ class IngrateController:
 
         async for ev, rs in self._apis.extensions_v1beta1.watch_namespaced_replica_set_list(
                 namespace,
-                labelSelector=f'{INGRATE_NAME_ANNOTATION}={name}'):
+                # Try to find ingrate deployment exposures using the name
+                # selector, which is what you would get if you ran
+                # `kubectl expose deployment NAME`.
+                labelSelector=f'{INGRATE_NAME_LABEL}={name}'):
             if ev not in {'ADDED', 'MODIFIED', 'DELETED'}:
                 continue
             if rs.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION] == revision:
