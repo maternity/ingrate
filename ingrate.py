@@ -3,17 +3,24 @@ import asyncio
 from collections import defaultdict
 from contextlib import suppress
 import difflib
+from itertools import repeat
 import json
 import logging
 from os import fspath
 from pathlib import Path
+from types import MappingProxyType as mappingproxy
 
 from aiohttp import ClientResponseError
+import mako.exceptions
 import mako.template
 import yaml
 
 from ak8s.apis import APIRegistry
-from ak8s.apis import fixup_path_path_params
+from ak8s.apis import K8sAPIOperation, StreamingMixin
+from ak8s.autils import amingle
+from ak8s.autils import astaple
+from ak8s.autils import athrottle
+from ak8s.autils import azip
 from ak8s.client import AK8sClient
 from ak8s.client import AK8sNotFound
 
@@ -23,8 +30,8 @@ async def main():
     parser.add_argument('-v', dest='verbose', action='count', default=0)
     parser.add_argument('-l', dest='selector', metavar='SELECTOR',
             default='', help='Label selector')
-    parser.add_argument('specs', metavar='SPEC', type=Path, nargs='+',
-            help='Location of k8s swagger specs')
+    parser.add_argument('spec', metavar='SPEC', type=Path,
+            help='Location of k8s swagger spec')
     #parser.add_argument('kubeconfig', metavar='KUBECONFIG', nargs='?')
     parser.add_argument('namespace', metavar='NAMESPACE')
     parser.add_argument('name', metavar='NAME')
@@ -32,27 +39,24 @@ async def main():
 
     level = logging.INFO
     level -= args.verbose*10
-    logging.basicConfig(level=level)
+    logging.basicConfig(level=level, format='%(asctime)s:%(levelname)s:%(name)s:%(message)s')
 
     logger = logging.getLogger('ingrate')
 
     registry = APIRegistry()
 
-    for pth in args.specs:
-        if pth.is_dir():
-            for pth in pth.rglob('*.json'):
-                with pth.open() as fh:
-                    spec = json.load(fh)
-                fixup_path_path_params(spec)
+    # TODO: these should be part of a standard config
+    @registry.add_api_base(r'(?:\w+\.)?watch\w+')
+    class K8sAPIWatchOperation(StreamingMixin, K8sAPIOperation):
+        pass
 
-                registry.add_spec(spec)
+    @registry.add_api_base(r'(?:\w+\.)?(?:read|list)\w+')
+    class K8sAPIReadItemOrCollectionOperation(
+            StreamingMixin.bind_stream_condition(lambda self: self.args.get('watch')),
+            K8sAPIOperation):
+        pass
 
-        else:
-            with pth.open() as fh:
-                spec = json.load(fh)
-            fixup_path_path_params(spec)
-
-            registry.add_spec(spec)
+    registry.load_spec(args.spec)
 
     templates = Path(__file__).parent
     haproxy_cfg_tpl = mako.template.Template(
@@ -60,19 +64,7 @@ async def main():
     deployment_tpl = mako.template.Template(
             filename=fspath(templates/'deployment.yaml.mako'))
 
-    async with AK8sClient.from_kubeconfig(models=registry.models) as ak8s:
-        # When a rule is deleted we'll get some event saying so.  It likely
-        # will be just a stub of what was deleted or modified.  We'll want
-        # to track what rules were generated from that, so we can replace
-        # or remove them.
-
-        # 1. Collect certs
-        # 2. Collect frontends (default, plus one for each host)
-        # 3. Collect backends
-        # 4. Generate config using template from configmap.
-        # 5. Push config into a versioned configmap.
-        # 6. Update deployment to use new configmap.
-
+    async with AK8sClient.from_kubeconfig(registry=registry) as ak8s:
         # - Initially, just point at service IPs.
         # - Look at having haproxy serve a healthcheck so k8s can tell when
         #   it is ready.
@@ -81,61 +73,6 @@ async def main():
         #   pay more to have ELB do routing.
         # - Later, consider whether there is a benefit to pushing endpoint
         #   information into haproxy.
-
-        # On watches:
-        # - Need to load subjects of watches, then continue to receive
-        #   updates.
-        # - Initially watches will send the latest values of the subjects.
-        #   It's not possible to tell when this initial response is
-        #   complete, other than by timing.  Maybe it is better to load
-        #   this explicitly, in a list request.  Of course there will still
-        #   be timing issues in live updates, but the initial configuration
-        #   from already existing resources shouldn't be subject to such
-        #   issues.
-
-        # Incremental development plan:
-        # - Start static, add watches later.
-        # - Generate haproxy config.
-        # - Generate configmap.
-        # - Generate deployment.
-        # - Make health checks work.
-        # - Get rollout working.
-
-        # For the moment, I am working with a multiple ingress -> haproxy
-        # config.  But this does lead to some quandries.
-        # 1. The order of in which ingresses are processed is not defined, so
-        #    when ingresses have overlapping rules with differing backends, the
-        #    resulting behavior may not be stable.
-        # 2. If one ingress defines one haproxy config then we can use ingress
-        #    annotations to set some extra behaviors.  If there are multiple
-        #    ingresses, then we can have surprising or broken behaviors when
-        #    the switches are applied across ingresses.
-        # 3. Referencing resources across namespaces isn't possible.  This
-        #    means the secrets would need to be copied in order to expose them,
-        #    which isn't great hygiene for secrets.
-        #
-        # In light of the secrets/namespaces issue, I am inclined to switch to
-        # a one ingress -> one haproxy config.  But if we do that, now we can't
-        # reference services across namespaces.  Ugh.
-        # Services can be referenced across namespaces using externalName
-        # services, but these only provide a symbolic mapping, meaning now our
-        # ingress controller (or haproxy itself) must resolve the name and
-        # propagate udpates.  Not really very tempting that.
-        #
-        # Other ideas:
-        # 1. Overload v1beta1.IngressBackend.serviceName to encode a namespace
-        #    name.  The k8s API server may be doing some validation making this
-        #    difficult (not allow a separator character), or impossible
-        #    (resolving the reference directly).
-        # 2. Copy secrets directly into the container, using an init container
-        #    or sidecar.
-        # 3. Just require all TLS secrets to be in the namespace of the
-        #    controller.
-        #
-        # 3 is the simplest to implement.
-        # 2 is more flexible, though it may require some extra steps to allow
-        # access in a cluster with RBAC (arguably a good thing).
-        # 1 is just not a very good idea, let us never speak of it again.
 
         # A full config and deployment takes:
         # - 1 or more ingresses
@@ -150,88 +87,354 @@ async def main():
         # that deployments will be able to generate versioned configmaps in the
         # future.
 
-        v1_api = ak8s.bind_api_group(registry.apis['v1'])
-        v1beta1_api = ak8s.bind_api_group(registry.apis['extensions/v1beta1'])
+        apis = ak8s.bind_api_group(registry.apis)
         ic = IngrateController(ak8s=ak8s, registry=registry)
 
-        # TODO: May want to restrict or prioritize namespaces.
-        ingress_list = await v1beta1_api.list_ingress_for_all_namespaces(
-                #includeUninitialized=True,
-                labelSelector=args.selector)
+        async for d in ic.watch_ingresses_and_related_resources(label_selector=args.selector, throttle=0.5):
+            # Sort to stabilize output.
+            d['ingresses'] = sorted(
+                    d['ingresses'],
+                    key=lambda ing: (ing.metadata.namespace, ing.metadata.name))
 
-        # Sort to stabilize output.
-        ingresses = sorted(
-                ingress_list.items,
-                key=lambda ing: (ing.metadata.namespace, ing.metadata.name))
+            try:
+                haproxy_cfg = haproxy_cfg_tpl.render(**d)
+            except Exception:
+                print(mako.exceptions.text_error_template().render())
+                continue
 
-        subs = set()
-        services = {}
+            ### Load existing deployment, to find the current version of the
+            ### configmap.
+            existing_deployment = await ic.read_deployment(args.namespace, args.name)
+            configmap = await ic.validate_or_create_ingrate_configmap(
+                    {'haproxy.cfg': haproxy_cfg},
+                    deployment=existing_deployment,
+                    namespace=args.namespace,
+                    name=args.name)
 
-        # Load related resources
-        for ing in ingresses:
-            if ing.spec.rules:
-                for rule in ing.spec.rules:
-                    for path in rule.http.paths:
-                        subs.add(v1_api.read_namespaced_service(
-                                ing.metadata.namespace,
-                                path.backend.serviceName))
+            ### Generate new deployment.
+            try:
+                deployment_yaml = deployment_tpl.render(
+                        configmap=configmap,
+                        **d)
+            except Exception:
+                print(mako.exceptions.text_error_template().render())
+                continue
 
-            if ing.spec.backend:
-                subs.add(v1_api.read_namespaced_service(
-                        ing.metadata.namespace,
-                        ing.spec.backend.serviceName))
+            if existing_deployment:
+                existing_deployment_yaml = existing_deployment.metadata.annotations.get('ingress-deployment-yaml')
 
-        done, pending = await asyncio.wait(subs)
-        for f in done:
-            sub = await f
-            if isinstance(sub, registry.models.v1.Service):
-                services[sub.metadata.namespace, sub.metadata.name] = sub
+                if existing_deployment_yaml and existing_deployment_yaml != deployment_yaml:
+                    logger.info(
+                            'diff %s\n%s',
+                            'deployment.yaml',
+                            ''.join(difflib.unified_diff(
+                                existing_deployment_yaml.splitlines(True),
+                                deployment_yaml.splitlines(True))))
 
-            else:
-                raise TypeError(f'Unhandled subresource: {sub!r}')
+            deployment = registry.models.io.k8s.kubernetes.pkg.apis.apps.v1beta1.Deployment._project(
+                    yaml.load(deployment_yaml))
 
-        haproxy_cfg = haproxy_cfg_tpl.render(
-                ingresses=ingresses,
-                services=services)
+            ic.init_deployment(deployment, name=args.name, configmap=configmap)
+            deployment.metadata.annotations['ingress-deployment-yaml'] = deployment_yaml
 
-        ### Load existing deployment, to find the current version of the
-        ### configmap.
-        existing_deployment = await ic.read_deployment(args.namespace, args.name)
-        configmap = await ic.validate_or_create_ingrate_configmap(
-                {'haproxy.cfg': haproxy_cfg},
-                deployment=existing_deployment,
-                namespace=args.namespace,
-                name=args.name)
+            deployment = await ic.replace_or_create_deployment(
+                    args.namespace, args.name, deployment)
+            deployment = await ic.watch_for_deployment_revision_to_post(
+                    deployment)
 
-        ### Generate new deployment.
-        deployment = registry.models.v1beta1.Deployment._project(
-                yaml.load(deployment_tpl.render(
-                    configmap=configmap,
-                    ingresses=ingresses)))
-        ic.init_deployment(deployment, name=args.name, configmap=configmap)
+            existing_deployment_revision = existing_deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
+            deployment_revision = deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
+            if deployment_revision == existing_deployment_revision:
+                logger.debug('Existing deployment suffices')
+                continue
 
-        deployment = await ic.replace_or_create_deployment(
-                args.namespace, args.name, deployment, configmap)
+            logger.info('Deployment revised, hang on...')
+
+            replicaset = await ic.watch_for_replicaset_matching_deployment_revision(
+                    deployment)
+
+            # Referencing the replicaset in the configmap owner references should
+            # cause the configmap to be cleaned up when the replicaset is removed.
+            await ic.add_configmap_owner_ref(configmap, replicaset)
+
+
+DEPLOYMENT_REVISION_ANNOTATION = 'deployment.kubernetes.io/revision'
+INGRATE_CONFIGMAP_VERSION_ANNOTATION = 'ingrate-configmap-version'
+#INGRATE_CONFIGMAP_VERSION_ANNOTATION = 'ingrate.maternity.io/configmap-version'
+INGRATE_NAME_ANNOTATION = 'ingrate-name'
+#INGRATE_NAME_ANNOTATION = 'ingrate.maternity.io/name'
+INGRATE_RELEASE_COOKIE_ANNOTATION = 'ingrate.maternity.io/release-cookie'
+INGRATE_RELEASE_DEFAULT_ANNOTATION = 'ingrate.maternity.io/release-default'
+INGRATE_RELEASE_SELECTOR_ANNOTATION = 'ingrate.maternity.io/release-selector'
 
 
 class IngrateController:
     def __init__(self, *, ak8s, registry):
         self._logger = logging.getLogger(self.__class__.__name__)
         self._models = registry.models
-        self._v1_api = ak8s.bind_api_group(registry.apis['v1'])
-        self._v1beta1_api = ak8s.bind_api_group(registry.apis['extensions/v1beta1'])
+        self._apis = ak8s.bind_api_group(registry.apis)
+
+    async def watch_ingresses_and_related_resources(
+            self, *,
+            label_selector='',
+            throttle=0.5):
+        mingler = amingle()
+
+        ingresses = None
+        services = None
+        secrets = None
+        release_services = None
+        release_map = None
+
+        mingler.add(azip(
+            repeat('ingresses'),
+            athrottle(
+                self.watch_ingresses(label_selector=label_selector),
+                throttle)))
+        services_stream = None
+        secrets_stream = None
+        release_services_stream = None
+
+        async for tag,d in mingler:
+            if tag == 'ingresses':
+                ingresses = list(d['ingresses'])
+
+                # (re)start services stream
+                if services_stream is not None:
+                    await services_stream.aclose()
+                services_stream = athrottle(
+                        self.watch_ingress_services(ingresses),
+                        throttle)
+                mingler.add(azip(repeat('services'), services_stream))
+                services = None
+
+                # (re)start secrets stream
+                if secrets_stream is not None:
+                    await secrets_stream.aclose()
+                secrets_stream = athrottle(
+                        self.watch_ingress_secrets(ingresses),
+                        throttle)
+                mingler.add(azip(repeat('secrets'), secrets_stream))
+                secrets = None
+
+            elif tag == 'services':
+                services = d['services'].copy()
+
+                # (re)start release services stream
+                if release_services_stream is not None:
+                    await release_services_stream.aclose()
+                release_services_stream = athrottle(
+                        self.watch_release_service_services(services.values()),
+                        throttle)
+                mingler.add(azip(
+                        repeat('release-services'),
+                        release_services_stream))
+                release_services = None
+                release_map = None
+
+            elif tag == 'secrets':
+                secrets = d['secrets'].copy()
+
+            elif tag == 'release-services':
+                release_services = d['services'].copy()
+                release_map = d['release_map'].copy()
+
+            if none_is_none(ingresses, services, secrets, release_services, release_map):
+                yield dict(
+                        ingresses=ingresses,
+                        services={**services, **release_services},
+                        secrets=secrets,
+                        release_map=release_map)
+
+    async def watch_ingresses(self, *, label_selector=''):
+        '''Emit a series of ingress sets as they are updated.'''
+        # TODO: namespaces filter
+
+        ingress_list = await self._apis.extensions_v1beta1.list_ingress_for_all_namespaces(
+                #includeUninitialized=True,
+                labelSelector=label_selector)
+        ingresses = {
+                (ing.metadata.namespace, ing.metadata.name): ing
+                for ing in ingress_list.items }
+        version = ingress_list.metadata.resourceVersion
+        yield dict(ingresses=ingresses.values())
+
+        async for ev, ing in self._apis.extensions_v1beta1.watch_ingress_list_for_all_namespaces.watch(
+                labelSelector=label_selector,
+                resourceVersion=version):
+            if ev in {'ADDED', 'MODIFIED'}:
+                ingresses[ing.metadata.namespace, ing.metadata.name] = ing
+            elif ev == 'DELETED':
+                del ingresses[ing.metadata.namespace, ing.metadata.name]
+            else:
+                continue
+            version = ing.metadata.resourceVersion
+            yield dict(ingresses=ingresses.values())
+
+    async def watch_ingress_services(self, ingresses):
+        '''Load and monitor the services related to the given ingresses.'''
+
+        backend_refs = {
+                (ing.metadata.namespace, path.backend.serviceName)
+                for ing in ingresses if ing.spec.rules
+                for rule in ing.spec.rules if rule.http
+                for path in rule.http.paths }
+        backend_refs.update(
+                (ing.metadata.namespace, ing.spec.backend.serviceName)
+                for ing in ingresses if ing.spec.backend)
+
+        pending = {
+                self._apis.core_v1.read_namespaced_service(ns, sn)
+                for ns, sn in backend_refs }
+
+        done, pending = await asyncio.wait(pending)
+
+        services = {}
+        while done:
+            svc = await done.pop()
+            services[svc.metadata.namespace, svc.metadata.name] = svc
+        yield dict(services=services)
+
+        async for ev, svc in amingle(
+                self._apis.core_v1.watch_namespaced_service.watch(
+                    ns, sn,
+                    resourceVersion=services[ns, sn].metadata.resourceVersion)
+                for ns, sn in backend_refs ):
+            if ev in {'ADDED', 'MODIFIED'}:
+                services[svc.metadata.namespace, svc.metadata.name] = svc
+
+            elif ev == 'DELETED':
+                try:
+                    del services[svc.metadata.namespace, svc.metadata.name]
+
+                except KeyError:
+                    continue
+
+            else:
+                continue
+
+            yield dict(services=services)
+
+    async def watch_ingress_secrets(self, ingresses):
+        '''Load and monitor the secrets related to the given ingresses.'''
+
+        secret_refs = {
+                (ing.metadata.namespace, tls.secretName)
+                for ing in ingresses if ing.spec.tls
+                for tls in ing.spec.tls }
+
+        pending = {
+                self._apis.core_v1.read_namespaced_secret(ns, sn)
+                for ns, sn in secret_refs }
+
+        done, pending = await asyncio.wait(pending)
+
+        secrets = {}
+        while done:
+            secret = await done.pop()
+            secrets[secret.metadata.namespace, secret.metadata.name] = secret
+        yield dict(secrets=secrets)
+
+        async for ev,secret in amingle(
+                self._apis.core_v1.watch_namespaced_secret.watch(
+                    ns, sn,
+                    resourceVersion=secrets[ns, sn].metadata.resourceVersion)
+                for ns, sn in secret_refs ):
+            if ev in {'ADDED', 'MODIFIED'}:
+                secrets[secret.metadata.namespace, secret.metadata.name] = secret
+
+            elif ev == 'DELETED':
+                try:
+                    del secrets[secret.metadata.namespace, secret.metadata.name]
+
+                except KeyError:
+                    continue
+
+            else:
+                continue
+
+            yield dict(secrets=secrets)
+
+    async def watch_release_service_services(self, services):
+        '''Load and monitor the services referred to by any release services.
+        '''
+
+        release_stubs = []
+        release_selectors = []
+        for rsvc in services:
+            if rsvc.metadata.annotations is None or INGRATE_RELEASE_SELECTOR_ANNOTATION not in rsvc.metadata.annotations:
+                continue
+
+            self._logger.info('Release service stub: %s:%s with selector %r',
+                    rsvc.metadata.namespace, rsvc.metadata.name,
+                    rsvc.metadata.annotations[INGRATE_RELEASE_SELECTOR_ANNOTATION])
+
+            release_stubs.append(rsvc)
+
+        pending = set()
+        for rsvc in release_stubs:
+            pending.add(astaple(
+                    rsvc,
+                    self._apis.core_v1.list_namespaced_service(
+                        rsvc.metadata.namespace,
+                        labelSelector=rsvc.metadata.annotations[INGRATE_RELEASE_SELECTOR_ANNOTATION])))
+
+        # A mapping of { (namespace, release_name) -> { service_names } }
+        release_map = {}
+        services = {}
+        versions = {}
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+            while done:
+                rsvc, service_list = await done.pop()
+                services.update(
+                        ((svc.metadata.namespace, svc.metadata.name), svc)
+                        for svc in service_list.items )
+                release_map[rsvc.metadata.namespace, rsvc.metadata.name] = {
+                        svc.metadata.name for svc in service_list.items }
+                versions[rsvc.metadata.annotations[INGRATE_RELEASE_SELECTOR_ANNOTATION]] = service_list.metadata.resourceVersion
+        yield dict(services=services, release_map=release_map)
+
+        if not release_stubs:
+            # Nothing to watch.
+            return
+
+            # Simulate 0 watches by waiting here forever.  Alternately we could
+            # return before the initial result, but the caller would have to
+            # handle that case.
+            await asyncio.Future()
+
+        async for rsvc,(ev,svc) in amingle(
+                # TODO: add resourceVersion from the service list response
+                azip(
+                    repeat(rsvc),
+                    self._apis.core_v1.watch_namespaced_service_list.watch(
+                        rsvc.metadata.namespace,
+                        labelSelector=rsvc.metadata.annotations[INGRATE_RELEASE_SELECTOR_ANNOTATION],
+                        resourceVersion=versions[rsvc.metadata.annotations[INGRATE_RELEASE_SELECTOR_ANNOTATION]]))
+                for rsvc in release_stubs):
+            if ev in {'ADDED', 'MODIFIED'}:
+                services[svc.metadata.namespace, svc.metadata.name] = svc
+                release_map[rsvc.metadata.namespace, rsvc.metadata.name].add(svc.metadata.name)
+            elif ev == 'DELETED':
+                del services[svc.metadata.namespace, svc.metadata.name]
+                release_map[rsvc.metadata.namespace, rsvc.metadata.name].discard(svc.metadata.name)
+            else:
+                continue
+            yield dict(services=services, release_map=release_map)
 
     async def read_deployment(self, namespace, name):
         with suppress(AK8sNotFound):
-            return await self._v1beta1_api.read_namespaced_deployment(
+            return await self._apis.extensions_v1beta1.read_namespaced_deployment(
                     namespace, name)
 
     async def read_configmap(self, namespace, name):
         with suppress(AK8sNotFound):
-            return await self._v1_api.read_namespaced_config_map(namespace, name)
+            return await self._apis.core_v1.read_namespaced_config_map(namespace, name)
 
     async def create_configmap(self, namespace, configmap):
-        return await self._v1_api.create_namespaced_config_map(namespace, configmap)
+        return await self._apis.core_v1.create_namespaced_config_map(namespace, configmap)
 
     async def validate_or_create_ingrate_configmap(self, data, *,
             deployment=None,
@@ -244,7 +447,7 @@ class IngrateController:
 
         if deployment is not None:
             existing_configmap_version = deployment.metadata.annotations.get(
-                    'ingrate-configmap-version')
+                    INGRATE_CONFIGMAP_VERSION_ANNOTATION)
         else:
             existing_configmap_version = None
 
@@ -270,7 +473,7 @@ class IngrateController:
                 else:
                     value = data[key]
                     existing_value = existing_configmap.data.get(key)
-                    self._logger.debug(
+                    self._logger.info(
                             'diff %s\n%s',
                             key,
                             ''.join(difflib.unified_diff(
@@ -282,10 +485,10 @@ class IngrateController:
                 if key not in data:
                     self._logger.debug('Existing configmap has extra %s', key)
 
-        configmap = self._models.v1.ConfigMap(
-                metadata=self._models.v1.ObjectMeta(
+        configmap = self._models.io.k8s.kubernetes.pkg.api.v1.ConfigMap(
+                metadata=self._models.io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta(
                     generateName=f'{name}-',
-                    labels={'ingrate-name': name}),
+                    labels={INGRATE_NAME_ANNOTATION: name}),
                 data=data)
 
         configmap = await self.create_configmap(namespace, configmap)
@@ -298,7 +501,7 @@ class IngrateController:
         deployment.metadata.name = name
         if deployment.metadata.annotations is None:
             deployment.metadata.annotations = {}
-        deployment.metadata.annotations['ingrate-configmap-version'] = configmap.metadata.name
+        deployment.metadata.annotations[INGRATE_CONFIGMAP_VERSION_ANNOTATION] = configmap.metadata.name
 
     def init_deployment(self, deployment, *, name, configmap):
         self.init_deployment_metadata(
@@ -306,32 +509,26 @@ class IngrateController:
                 configmap=configmap,
                 name=name)
         if deployment.spec.template.metadata is None:
-            deployment.spec.template.metadata = self._models.v1.ObjectMeta()
+            deployment.spec.template.metadata = self._models.io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta()
         # Deployment selector will be set to match labels of deployment
         # template if no selector is provided.
         if deployment.spec.template.metadata.labels is None:
             deployment.spec.template.metadata.labels = {}
-        deployment.spec.template.metadata.labels['ingrate-name'] = name
+        deployment.spec.template.metadata.labels[INGRATE_NAME_ANNOTATION] = name
 
     async def replace_or_create_deployment(
-            self, namespace, name, deployment, configmap):
+            self, namespace, name, deployment):
         try:
-            deployment = await self._v1beta1_api.replace_namespaced_deployment(
+            deployment = await self._apis.extensions_v1beta1.replace_namespaced_deployment(
                     namespace, name, deployment)
 
             self._logger.info('Updated deployment')
 
         except AK8sNotFound:
-            deployment = await self._v1beta1_api.create_namespaced_deployment(
+            deployment = await self._apis.extensions_v1beta1.create_namespaced_deployment(
                     namespace, deployment)
 
             self._logger.info('Created deployment')
-
-        # Referencing the deployment in the configmap owner references
-        # should cause the configmap to be cleaned up when the deployment
-        # is removed.
-        # TODO: Reference the replicaset created with this change, instead.
-        await self.add_configmap_owner_ref(configmap, deployment)
 
         return deployment
 
@@ -341,46 +538,59 @@ class IngrateController:
                 for ref in target.metadata.ownerReferences ):
             return
 
+        self._logger.info('Updating references on ConfigMap %r',
+                target.metadata.name)
+
         if target.metadata.ownerReferences is None:
             target.metadata.ownerReferences = []
 
         target.metadata.ownerReferences.append(
-                self._models.v1.OwnerReference(
+                self._models.io.k8s.apimachinery.pkg.apis.meta.v1.OwnerReference(
                     apiVersion=referrent.apiVersion,
                     kind=referrent.kind,
                     name=referrent.metadata.name,
                     uid=referrent.metadata.uid))
 
-        # TODO: Send a patch?
-        # Where do I put this application/strategic-merge-patch+json ?
-        # To do this, I need a type that somehow conveys the content-type
-        # to AK8sClient.
-        #
-        # client considers types that body can be
-        # client considers type that api can consume
-        # client chooses one that is common
-        # aiohttp payloads carry metadata, maybe just implement that
-        # don't worry about actual content-type negotiation or agreement
-        # if the caller provides the right type, it will work
-        #
-        # This would be an opportunity to do something like:
-        #
-        #     configmap_patch = StrategicMergePatch(
-        #             configmap,
-        #             'metadata/ownerReferences')
-        #
-        # Which is nice, because it makes it unnecessary to rebuild a
-        # sparse configmap to serve as a patch.
-        #
-        #await self._v1_api.patch_namespaced_config_map(
-        #        configmap.metadata.namespace,
-        #        configmap.metadata.name,
-        #        configmap_patch)
+        # TODO: Send a patch, instead?
 
-        return await self._v1_api.replace_namespaced_config_map(
+        return await self._apis.core_v1.replace_namespaced_config_map(
                 target.metadata.namespace,
                 target.metadata.name,
                 target)
+
+    async def watch_for_deployment_revision_to_post(self, deployment):
+        # Watch for the controller to post revision info.
+        async for ev, obj in self._apis.extensions_v1beta1.watch_namespaced_deployment.watch(
+                deployment.metadata.namespace, deployment.metadata.name,
+                resourceVersion=deployment.metadata.resourceVersion):
+            if ev not in {'ADDED', 'MODIFIED', 'DELETED'}:
+                continue
+            if DEPLOYMENT_REVISION_ANNOTATION in obj.metadata.annotations:
+                return obj
+        else:
+            raise RuntimeError('Deployment revision never posted!')
+
+    async def watch_for_replicaset_matching_deployment_revision(self, deployment):
+        namespace = deployment.metadata.namespace
+        name = deployment.metadata.name
+
+        revision = deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
+
+        async for ev, rs in self._apis.extensions_v1beta1.watch_namespaced_replica_set_list(
+                namespace,
+                labelSelector=f'{INGRATE_NAME_ANNOTATION}={name}'):
+            if ev not in {'ADDED', 'MODIFIED', 'DELETED'}:
+                continue
+            if rs.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION] == revision:
+                self._logger.info(
+                        'Found ReplicaSet %r for deployment revision %r',
+                        rs.metadata.name,
+                        revision)
+                return rs
+
+
+def none_is_none(*items):
+    return not any( item is None for item in items )
 
 
 if __name__ == '__main__':

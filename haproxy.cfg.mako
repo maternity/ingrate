@@ -52,7 +52,8 @@ frontend frontend
     # Legacy ACLs
     #acl proxy_https hdr(x-forwarded-proto) https
 
-    # Dynamic path ACLs <%
+    # Dynamic path ACLs
+<%
 
   # Flatten the set of paths.
   paths = {
@@ -66,7 +67,7 @@ frontend frontend
   path_acls = {
     path: f'path_{sha1(path.encode()).digest().hex()[:6]}'
     for path in set(paths) }
-%>
+%>\
 % for path in paths:
     acl ${path_acls[path]} path_beg ${path}
 % endfor
@@ -80,7 +81,7 @@ frontend frontend
     for rule in ing.spec.rules if rule.http
     for path in rule.http.paths
   ]
-%>
+%>\
 % for ing, rule, path in rule_paths:
 %   if rule.host is not None and path.path is not None:
     use_backend svc_${ing.metadata.namespace}_${path.backend.serviceName}_${path.backend.servicePort} if { hdr_dom(host) ${rule.host} } ${path_acls[path.path]} # path ${path.path}
@@ -112,11 +113,26 @@ frontend frontend
 ## Sort to avoid churn.
 % for svc_ns, svc_name, svc_port in sorted(backends):
 
+<%
+    service = services[svc_ns, svc_name]
+    release_cookie = service.metadata.annotations and service.metadata.annotations.get('ingrate.maternity.io/release-cookie')
+    default_release = service.metadata.annotations and service.metadata.annotations.get('ingrate.maternity.io/release')
+    release_services = release_map.get((service.metadata.namespace, service.metadata.name))
+%>\
 backend svc_${svc_ns}_${svc_name}_${svc_port}
-    balance roundrobin
-    #TODO: cookie build indirect preserve
     #TODO: confirm clusterIP is set?
-    server ${svc_ns}_${svc_name}_${svc_port} ${services[svc_ns, svc_name].spec.clusterIP}:${svc_port}
-% endfor
+    balance roundrobin
+%   if release_cookie:
+    cookie ${release_cookie} indirect preserve
+%   endif
 
-#backend unavailable
+%   if release_services is not None:
+%     for rsvc_name in sorted(release_services):
+<%      rservice = services[svc_ns, rsvc_name] %>\
+    server ${svc_ns}_${rsvc_name}_${svc_port} ${rservice.spec.clusterIP}:${svc_port} cookie ${rsvc_name} weight ${100 if rsvc_name == default_release else 0}
+%     endfor
+%   else:
+    server ${svc_ns}_${svc_name}_${svc_port} ${service.spec.clusterIP}:${svc_port}
+%   endif\
+
+% endfor
