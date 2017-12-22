@@ -14,9 +14,14 @@ spec:
   template:
     #metadata: {}
     spec:
+      # TODO: Not hardcode this
+      # :; kubectl create serviceaccount foo
+      # :; kubectl create role ingress-secret-reader --resource=secret --verb=get
+      # :; kubectl create rolebinding --serviceaccount default:foo --role ingress-secret-reader foo-is-an-ingress-secret-reader
+      serviceAccountName: foo
       initContainers:
       - name: secret-loader
-        # Need basic shell, kubectl, jq, coreutils.  
+        # Need basic shell, kubectl, jq, coreutils.
         image: quay.io/maternity/k8s-util:1
         volumeMounts:
         - name: certs
