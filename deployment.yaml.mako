@@ -28,30 +28,39 @@ spec:
 <%text>
           cd /usr/local/etc/haproxy/certs
 
-
           # Generate a totally legit fallback cert so haproxy will start.
           openssl req -new -x509 -newkey rsa:1024 -subj '/CN=*' -nodes \
               -keyout zz-fallback -out zz-fallback
 
-          for nsqsn; do
+          # We aren't going to copy the secrets verbatim into the deployment,
+          # instead we'll reference the location of the secret, along with the
+          # current version so the deployment can be invalidated if secrets are
+          # changed.
+          for secret; do
             # jq may be optional, but I couldn't figure out how to get at
             # .data["tls.crt"] with jsonpath or go-template.
-            kubectl get secret $${nsqsn#*/} -n $${nsqsn%%/*} -o json |
-              jq '.data["tls.crt"], .data["tls.key"]' |
+            (
+            set -- $secret
+            ns=$1
+            sn=$2
+            out=${ns}__${sn}
+            kubectl get secret -n $ns $sn -o json |
+              jq -r '.data."tls.crt", .data."tls.key"' |
               # NOTE: coreutils base64 handles this (more than one stream) fine
-              base64 -d >$${nsqsn//\//__}
+              base64 -d >$out
+            # Don't leave an empty file, or haproxy won't start.  In some cases
+            # we might prefer the pod to fail (when another one is still
+            # running, that might have a good cert still).  Other times, we'll
+            # want it to run without, and the operator can iterate to get the
+            # missing pieces in place.
+            grep -q '^-----BEGIN' $out || rm -f $out
+            )
           done
           ls -ltr
 </%text>
         - emptiness # $0
-<%
-  secrets = [
-    (ing.metadata.namespace, tls.secretName)
-    for ing in ingresses if ing.spec.tls
-    for tls in ing.spec.tls ]
-%>
-% for ns, sn in secrets:
-        - ${ns}/${sn}
+% for (ns,name),secret in sorted(secrets.items()):
+        - ${secret.metadata.namespace} ${secret.metadata.name} ${secret.metadata.resourceVersion}
 % endfor
       containers:
       - name: haproxy
