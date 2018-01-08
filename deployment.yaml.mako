@@ -50,7 +50,9 @@ spec:
             sn=$2
             out=${ns}__${sn}
             kubectl get secret -n $ns $sn -o json |
-              jq -r '.data."tls.crt", .data."tls.key"' |
+              # NOTE: Cg== is a base64 encoded newline to ensure the last chain
+              # cert doens't run into the private key.
+              jq -r '.data."tls.crt", "Cg==", .data."tls.key"' |
               # NOTE: coreutils base64 handles this (more than one stream) fine
               base64 -d >$out
             # Don't leave an empty file, or haproxy won't start.  In some cases
