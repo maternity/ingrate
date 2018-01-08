@@ -194,7 +194,7 @@ async def main():
 
                 # Merge multiple services into one.
                 load_balancer = registry.models.io.k8s.kubernetes.pkg.api.v1.LoadBalancerStatus(ingress=[])
-                for lb in load_balancers:
+                for _,lb in sorted(load_balancers.items()):
                     load_balancer.ingress.extend(lb.ingress)
 
                 for ing in ingresses:
@@ -670,7 +670,7 @@ class IngrateController:
                     del load_balancers[svc.metadata.name]
             else:
                 continue
-            yield dict(load_balancers=load_balancers.values())
+            yield dict(load_balancers=load_balancers)
 
 
 def none_is_none(*items):
