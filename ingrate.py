@@ -16,7 +16,8 @@ import mako.template
 import yaml
 
 from ak8s.apis import APIRegistry
-from ak8s.apis import K8sAPIOperation, StreamingMixin
+from ak8s.apis.operation import K8sAPIOperation
+from ak8s.apis.operation import StreamingMixin
 from ak8s.autils import amingle
 from ak8s.autils import astaple
 from ak8s.autils import athrottle
