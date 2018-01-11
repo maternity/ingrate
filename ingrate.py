@@ -38,7 +38,7 @@ async def main():
     parser.add_argument('name', metavar='NAME')
     args = parser.parse_args()
 
-    level = logging.INFO
+    level = logging.WARN
     level -= args.verbose*10
     logging.basicConfig(level=level, format='%(asctime)s:%(levelname)s:%(name)s:%(message)s')
 
