@@ -60,7 +60,7 @@ async def main():
     deployment_tpl = mako.template.Template(
             filename=fspath(templates/'deployment.yaml.mako'))
 
-    async with AK8sClient.from_kubeconfig(registry=registry) as ak8s:
+    async with AK8sClient(registry=registry) as ak8s:
         # - Initially, just point at service IPs.
         # - Look at having haproxy serve a healthcheck so k8s can tell when
         #   it is ready.
