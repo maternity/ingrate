@@ -31,9 +31,6 @@ async def main():
     parser.add_argument('-v', dest='verbose', action='count', default=0)
     parser.add_argument('-l', dest='selector', metavar='SELECTOR',
             default='', help='Label selector')
-    parser.add_argument('spec', metavar='SPEC', type=Path,
-            help='Location of k8s swagger spec')
-    #parser.add_argument('kubeconfig', metavar='KUBECONFIG', nargs='?')
     parser.add_argument('namespace', metavar='NAMESPACE')
     parser.add_argument('name', metavar='NAME')
     args = parser.parse_args()
@@ -44,7 +41,7 @@ async def main():
 
     logger = logging.getLogger('ingrate')
 
-    registry = APIRegistry()
+    registry = APIRegistry(release='1.8')
 
     # TODO: these should be part of a standard config
     @registry.add_api_base(r'(?:\w+\.)?watch\w+')
@@ -56,8 +53,6 @@ async def main():
             StreamingMixin.bind_stream_condition(lambda self: self.args.get('watch')),
             K8sAPIOperation):
         pass
-
-    registry.load_spec(args.spec)
 
     templates = Path(__file__).parent
     haproxy_cfg_tpl = mako.template.Template(
