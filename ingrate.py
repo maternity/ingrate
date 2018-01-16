@@ -1,14 +1,11 @@
 import argparse
 import asyncio
-from collections import defaultdict
 from contextlib import suppress
 import difflib
 from itertools import repeat
-import json
 import logging
 from os import fspath
 from pathlib import Path
-from types import MappingProxyType as mappingproxy
 
 from aiohttp import ClientResponseError
 import mako.exceptions
@@ -413,7 +410,6 @@ class IngrateController:
         '''
 
         release_stubs = []
-        release_selectors = []
         for rsvc in services:
             if rsvc.metadata.annotations is None or INGRATE_RELEASE_SELECTOR_ANNOTATION not in rsvc.metadata.annotations:
                 continue
