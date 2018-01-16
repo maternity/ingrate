@@ -126,6 +126,7 @@ async def main():
                 try:
                     deployment_yaml = deployment_tpl.render(
                             configmap=configmap,
+                            serviceaccount_name=f'ingrate-{args.name}-proxy',
                             **d)
                 except Exception:
                     print(mako.exceptions.text_error_template().render())
