@@ -213,10 +213,8 @@ async def main():
 
 
 DEPLOYMENT_REVISION_ANNOTATION = 'deployment.kubernetes.io/revision'
-INGRATE_CONFIGMAP_VERSION_ANNOTATION = 'ingrate-configmap-version'
-#INGRATE_CONFIGMAP_VERSION_ANNOTATION = 'ingrate.maternity.io/configmap-version'
-INGRATE_NAME_LABEL = 'ingrate-name'
-#INGRATE_NAME_LABEL = 'ingrate.maternity.io/name'
+INGRATE_CONFIGMAP_VERSION_ANNOTATION = 'ingrate.maternity.io/configmap-version'
+INGRATE_NAME_LABEL = 'ingrate.maternity.io/name'
 INGRATE_RELEASE_COOKIE_ANNOTATION = 'ingrate.maternity.io/release-cookie'
 INGRATE_RELEASE_DEFAULT_ANNOTATION = 'ingrate.maternity.io/release-default'
 INGRATE_RELEASE_SELECTOR_ANNOTATION = 'ingrate.maternity.io/release-selector'
