@@ -533,7 +533,6 @@ class IngrateController:
                                 existing_value.splitlines(True),
                                 value.splitlines(True))))
 
-        else:
             for key in existing_configmap.data:
                 if key not in data:
                     self._logger.debug('Existing configmap has extra %s', key)
