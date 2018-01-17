@@ -144,6 +144,11 @@ async def main():
                                     existing_deployment_yaml.splitlines(True),
                                     deployment_yaml.splitlines(True))))
 
+                    existing_deployment_revision = existing_deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
+                else:
+
+                    existing_deployment_revision = None
+
                 deployment = registry.models.io.k8s.kubernetes.pkg.apis.apps.v1beta1.Deployment._project(
                         yaml.load(deployment_yaml))
                 ic.init_deployment(deployment, name=args.name, configmap=configmap)
@@ -155,7 +160,6 @@ async def main():
                 deployment = await ic.watch_for_deployment_revision_to_post(
                         deployment)
 
-                existing_deployment_revision = existing_deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
                 deployment_revision = deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
                 if deployment_revision == existing_deployment_revision:
                     logger.debug('Existing deployment suffices')
