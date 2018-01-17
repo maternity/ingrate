@@ -110,20 +110,24 @@ async def main():
                     print(mako.exceptions.text_error_template().render())
                     continue
 
+                deployment_name = f'ingrate-{args.name}-proxy'
+                serviceaccount_name = f'ingrate-{args.name}-proxy'
+
                 ### Load existing deployment, to find the current version of the
                 ### configmap.
-                existing_deployment = await ic.read_deployment(args.namespace, args.name)
+                existing_deployment = await ic.read_deployment(
+                        args.namespace, deployment_name)
                 configmap = await ic.validate_or_create_ingrate_configmap(
                         {'haproxy.cfg': haproxy_cfg},
                         deployment=existing_deployment,
                         namespace=args.namespace,
-                        name=args.name)
+                        ingrate_name=args.name)
 
                 ### Generate new deployment.
                 try:
                     deployment_yaml = deployment_tpl.render(
                             configmap=configmap,
-                            serviceaccount_name=f'ingrate-{args.name}-proxy',
+                            serviceaccount_name=serviceaccount_name,
                             **d)
                 except Exception:
                     print(mako.exceptions.text_error_template().render())
@@ -142,12 +146,12 @@ async def main():
 
                 deployment = registry.models.io.k8s.kubernetes.pkg.apis.apps.v1beta1.Deployment._project(
                         yaml.load(deployment_yaml))
-
                 ic.init_deployment(deployment, name=args.name, configmap=configmap)
+                deployment.metadata.name = deployment_name
                 deployment.metadata.annotations['ingress-deployment-yaml'] = deployment_yaml
 
                 deployment = await ic.replace_or_create_deployment(
-                        args.namespace, args.name, deployment)
+                        args.namespace, deployment)
                 deployment = await ic.watch_for_deployment_revision_to_post(
                         deployment)
 
@@ -487,13 +491,8 @@ class IngrateController:
 
     async def validate_or_create_ingrate_configmap(self, data, *,
             deployment=None,
-            name=None,
-            namespace=None):
-        if name is None:
-            name = deployment.metadata.name
-        if namespace is None:
-            namespace = deployment.metadata.name
-
+            ingrate_name,
+            namespace):
         if deployment is not None:
             existing_configmap_version = deployment.metadata.annotations.get(
                     INGRATE_CONFIGMAP_VERSION_ANNOTATION)
@@ -535,8 +534,8 @@ class IngrateController:
 
         configmap = self._models.io.k8s.kubernetes.pkg.api.v1.ConfigMap(
                 metadata=self._models.io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta(
-                    generateName=f'{name}-',
-                    labels={INGRATE_NAME_LABEL: name}),
+                    generateName=f'ingrate-{ingrate_name}-',
+                    labels={INGRATE_NAME_LABEL: ingrate_name}),
                 data=data)
 
         configmap = await self.create_configmap(namespace, configmap)
@@ -545,8 +544,7 @@ class IngrateController:
 
         return configmap
 
-    def init_deployment_metadata(self, deployment, *, name, configmap):
-        deployment.metadata.name = name
+    def init_deployment_metadata(self, deployment, *, configmap):
         if deployment.metadata.annotations is None:
             deployment.metadata.annotations = {}
         deployment.metadata.annotations[INGRATE_CONFIGMAP_VERSION_ANNOTATION] = configmap.metadata.name
@@ -554,8 +552,7 @@ class IngrateController:
     def init_deployment(self, deployment, *, name, configmap):
         self.init_deployment_metadata(
                 deployment,
-                configmap=configmap,
-                name=name)
+                configmap=configmap)
         if deployment.spec.template.metadata is None:
             deployment.spec.template.metadata = self._models.io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta()
         # Deployment selector will be set to match labels of deployment
@@ -565,10 +562,10 @@ class IngrateController:
         deployment.spec.template.metadata.labels[INGRATE_NAME_LABEL] = name
 
     async def replace_or_create_deployment(
-            self, namespace, name, deployment):
+            self, namespace, deployment):
         try:
             deployment = await self._apis.extensions_v1beta1.replace_namespaced_deployment(
-                    namespace, name, deployment)
+                    namespace, deployment.metadata.name, deployment)
 
             self._logger.info('Updated deployment')
 
@@ -620,8 +617,7 @@ class IngrateController:
 
     async def watch_for_replicaset_matching_deployment_revision(self, deployment):
         namespace = deployment.metadata.namespace
-        name = deployment.metadata.name
-
+        ingrate_name = deployment.metadata.labels[INGRATE_NAME_LABEL]
         revision = deployment.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION]
 
         async for ev, rs in self._apis.extensions_v1beta1.watch_namespaced_replica_set_list(
@@ -629,7 +625,7 @@ class IngrateController:
                 # Try to find ingrate deployment exposures using the name
                 # selector, which is what you would get if you ran
                 # `kubectl expose deployment NAME`.
-                labelSelector=f'{INGRATE_NAME_LABEL}={name}'):
+                labelSelector=f'{INGRATE_NAME_LABEL}={ingrate_name}'):
             if ev not in {'ADDED', 'MODIFIED', 'DELETED'}:
                 continue
             if rs.metadata.annotations[DEPLOYMENT_REVISION_ANNOTATION] == revision:
