@@ -45,10 +45,6 @@ frontend frontend
     option forwardfor
     http-request set-header X-Forwarded-Proto https if { ssl_fc }
 
-    stats enable
-    stats uri /__sterling__?stats
-    stats realm Authentication\ Required
-
     # Legacy ACLs
     #acl proxy_https hdr(x-forwarded-proto) https
 
